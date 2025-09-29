@@ -1,36 +1,61 @@
-use crate::math::{Vec3, Ray};
+use raylib::prelude::*;
 
-#[derive(Clone, Copy)]  
-pub struct OrbitCamera{
-    pub target: Vec3,
-    pub distance: f32,
-    pub azimuth: f32,
-    pub elevation: f32,
-    pub fov_y: f32,
-    pub aspect: f32,
-    pub eye: Vec3,
+pub struct Camera {
+    pub eye: Vector3,
+    pub center: Vector3,
+    pub up: Vector3,
+    pub forward: Vector3,
+    pub right: Vector3,
 }
 
-impl OrbitCamera{
-    pub fn new(eye:Vec3,target:Vec3,fov_y:f32,aspect:f32)->Self{
-        Self{target,distance:(eye-target).len(),azimuth:0.0,elevation:0.3,fov_y,aspect,eye}
+impl Camera {
+    pub fn new(eye: Vector3, center: Vector3, up: Vector3) -> Self {
+        let mut c = Self {
+            eye, center, up,
+            forward: Vector3::zero(),
+            right: Vector3::zero(),
+        };
+        c.update_basis_vectors();
+        c
     }
-    pub fn update_eye(&mut self){
-        let ca = self.azimuth.cos(); let sa = self.azimuth.sin();
-        let ce = self.elevation.cos(); let se = self.elevation.sin();
-        let x = self.distance * ce * ca;
-        let y = self.distance * se;
-        let z = self.distance * ce * sa;
-        self.eye = self.target + Vec3::new(x,y,z);
+
+    pub fn update_basis_vectors(&mut self) {
+        self.forward = (self.center - self.eye).normalized();
+        self.right = self.forward.cross(self.up).normalized();
+        self.up = self.right.cross(self.forward);
     }
-    pub fn ray(&self, u: f32, v: f32) -> Ray {
-        let forward = (self.target - self.eye).normalized();
-        let right = forward.cross(Vec3::new(0.0,1.0,0.0)).normalized();
-        let up = right.cross(forward).normalized();
-        let tan = (self.fov_y*0.5).tan();
-        let px = (2.0*u - 1.0) * tan * self.aspect;
-        let py = (1.0 - 2.0*v) * tan;
-        let dir = (forward + right*px + up*py).normalized();
-        Ray::new(self.eye, dir)
+
+    pub fn orbit(&mut self, yaw: f32, pitch: f32) {
+        let rel = self.eye - self.center;
+        let r = rel.length();
+        let cur_yaw = rel.z.atan2(rel.x);
+        let cur_pitch = (rel.y / r).asin();
+
+        let ny = cur_yaw + yaw;
+        let np = (cur_pitch + pitch).clamp(-1.45, 1.45);
+
+        let cp = np.cos();
+        let new_rel = Vector3::new(r * cp * ny.cos(), r * np.sin(), r * cp * ny.sin());
+        self.eye = self.center + new_rel;
+        self.update_basis_vectors();
+    }
+
+    pub fn dolly(&mut self, amount: f32) {
+        let dir = self.forward;
+        let new_eye = self.eye + dir * amount;
+        // evita atravesar el centro
+        if (new_eye - self.center).length() > 0.2 {
+            self.eye = new_eye;
+            self.update_basis_vectors();
+        }
+    }
+
+    /// pasa de coords cámara a mundo (base derecha, arriba, -forward)
+    pub fn basis_change(&self, v: &Vector3) -> Vector3 {
+        Vector3::new(
+            v.x * self.right.x + v.y * self.up.x - v.z * self.forward.x,
+            v.x * self.right.y + v.y * self.up.y - v.z * self.forward.y,
+            v.x * self.right.z + v.y * self.up.z - v.z * self.forward.z,
+        )
     }
 }

@@ -1,427 +1,272 @@
-use std::os::raw::c_void;
-use std::time::Instant;
-
 use raylib::prelude::*;
-use raylib::ffi;
-use rayon::prelude::*;
+use std::f32::consts::PI;
 
-use crate::math::{Vec3, Ray};
-use crate::material::{Material, MaterialKind, Texture, load_image_tex, load_cubemap};
-use crate::scene::{Scene, Light};
-use crate::shapes::{Aabb, Plane};
-
-mod math;
+mod camera;
+mod framebuffer;
 mod material;
-mod scene;
-mod shapes;
-mod shading;
+mod ray_intersect;
+mod cube;
+mod light;
+mod texture;
+mod skybox;
 
-// =================== Config ventana / render ===================
-const WINDOW_W: i32 = 1280;
-const WINDOW_H: i32 = 720;
+use camera::Camera;
+use framebuffer::Framebuffer;
+use material::{Material, v3_to_color};
+use ray_intersect::{Intersect, RayIntersect, reflect, refract, offset_origin};
+use cube::Cube;
+use light::Light;
+use texture::TextureCPU;
+use skybox::Skybox;
 
-// Render interno (más chico = más FPS). Se ajusta dinámicamente.
-const RENDER_W: usize = 960;
-const RENDER_H: usize = 540;
+// === sombreado ===
+fn phong_shade(hit: &Intersect, light: &Light, view_dir: Vector3) -> (Vector3 /*kd*/, f32 /*spec*/) {
+    let ldir = (light.pos - hit.point).normalized();
+    let ndotl = hit.normal.dot(ldir).max(0.0);
 
-// Cámara (control)
-const CAM_FOV_DEG: f32   = 55.0;
-const CAM_AZIM_SPEED: f32 = 2.2;  // rad/s   (izq-der)
-const CAM_PAN_Y_SPEED: f32 = 3.2; // u/s     (arr-aba)
-const CAM_ZOOM_SPEED: f32  = 4.0; // u/s     (PgUp/PgDn)
+    // componemos kd por componente (evita Vector3 * Vector3 directo)
+    let base = hit.mat.diffuse * (ndotl * light.intensity); // Vector3 * escalar
+    let lc = light.color; // Vector3 (1,1,1) o el color de la luz
+    let kd = Vector3::new(base.x * lc.x, base.y * lc.y, base.z * lc.z);
 
-// Calidad dinámica (F1/F2). Min bajado a 0.45 para más FPS si hace falta.
-static mut QUALITY_SCALE: f32 = 1.0; // 0.45..1.0
-
-// =================== Cámara orbital con pan vertical ===================
-struct OrbitalCam {
-    target_base: Vec3, // punto base (centro del SLS)
-    y_ofs: f32,        // pan vertical absoluto (mueve cámara y target)
-    distance: f32,     // radio de la órbita (zoom)
-    azim: f32,         // ángulo horizontal (rotación alrededor del SLS)
-    elev: f32,         // inclinación fija pequeña para ver desde arriba
-    fov_y: f32,        // grados
-    aspect: f32,
-}
-impl OrbitalCam {
-    fn new(target: Vec3, distance: f32, azim: f32, elev: f32, fov_y: f32, aspect: f32) -> Self {
-        Self { target_base: target, y_ofs: 0.0, distance, azim, elev, fov_y, aspect }
-    }
-    fn target(&self) -> Vec3 {
-        self.target_base + Vec3::new(0.0, self.y_ofs, 0.0)
-    }
-    fn eye(&self) -> Vec3 {
-        let tgt = self.target();
-        let ce = self.elev.cos();
-        let x = self.distance * ce * self.azim.cos();
-        let z = self.distance * ce * self.azim.sin();
-        let y = self.distance * self.elev.sin();
-        tgt + Vec3::new(x, y, z)
-    }
-    /// Devuelve (origen, base_u, base_v, forward) para construir rays
-    fn frame(&self) -> (Vec3, Vec3, Vec3, Vec3) {
-        let eye = self.eye();
-        let tgt = self.target();
-        let f = (tgt - eye).normalized();
-        let up = Vec3::new(0.0, 1.0, 0.0);
-        let r = f.cross(up).normalized();
-        let u2 = r.cross(f).normalized();
-
-        let tan_fov = (self.fov_y.to_radians() * 0.5).tan();
-        let half_v = tan_fov;
-        let half_h = tan_fov * self.aspect;
-
-        let base_u = r * half_h;
-        let base_v = u2 * half_v;
-
-        (eye, base_u, base_v, f)
-    }
+    let r = reflect(&-ldir, &hit.normal).normalized();
+    let spec = view_dir.dot(r).max(0.0).powf(hit.mat.specular_exp);
+    (kd, spec)
 }
 
-// =================== App ===================
+fn cast_ray(
+    ro: &Vector3, rd: &Vector3,
+    objects: &[Box<dyn RayIntersect + Sync>],
+    light: &Light,
+    sky: &Skybox,
+    tex_albedo: &dyn Fn(&Intersect)->Vector3,
+    depth: u32
+) -> Vector3 {
+    if depth > 3 { return sky.sample(*rd); }
+
+    let mut best = Intersect::empty();
+    let mut z = f32::INFINITY;
+    for o in objects {
+        let i = o.ray_intersect(ro, rd);
+        if i.hit && i.t < z { z = i.t; best = i; }
+    }
+    if !best.hit { return sky.sample(*rd); }
+
+    // texturas (albedo multiplicativo)
+    let base_tex = tex_albedo(&best);
+    let view_dir = (*ro - best.point).normalized();
+    let (kd_col, spec_sc) = phong_shade(&best, light, view_dir);
+    let kd = Vector3::new(
+        kd_col.x * base_tex.x,
+        kd_col.y * base_tex.y,
+        kd_col.z * base_tex.z
+    );
+    let ks = Vector3::new(spec_sc, spec_sc, spec_sc) * light.intensity;
+
+    // componentes
+    let (ka, ks_w, kr, kt) = (best.mat.albedo[0], best.mat.albedo[1], best.mat.albedo[2], best.mat.albedo[3]);
+
+    let mut color = kd * ka + ks * ks_w;
+
+    // reflexión
+    if kr > 0.0 {
+        let rdir = reflect(rd, &best.normal).normalized();
+        let rorig = offset_origin(&best.point, &best.normal, &rdir);
+        let rc = cast_ray(&rorig, &rdir, objects, light, sky, tex_albedo, depth+1);
+        color = color*(1.0-kr) + rc*kr;
+    }
+
+    // refracción
+    if kt > 0.0 {
+        if let Some(tdir) = refract(rd, &best.normal, best.mat.ior) {
+            let torig = offset_origin(&best.point, &best.normal, &tdir);
+            let tc = cast_ray(&torig, &tdir, objects, light, sky, tex_albedo, depth+1);
+            color = color*(1.0-kt) + tc*kt;
+        } else {
+            // TIR: ya lo maneja la reflexión de arriba
+        }
+    }
+
+    color
+}
+
+fn render(
+    fb: &mut Framebuffer,
+    cam: &Camera,
+    light: &Light,
+    sky: &Skybox,
+    objects: &[Box<dyn RayIntersect + Sync>],
+    tex_albedo: &dyn Fn(&Intersect)->Vector3
+) {
+    let w = fb.width as f32;
+    let h = fb.height as f32;
+    let aspect = w/h;
+    let fov = PI/3.0;
+    let scale = (fov*0.5).tan();
+
+    for y in 0..fb.height {
+        for x in 0..fb.width {
+            let sx = (2.0 * x as f32) / w - 1.0;
+            let sy = -(2.0 * y as f32) / h + 1.0;
+            let sx = sx * aspect * scale;
+            let sy = sy * scale;
+
+            let rd_cam = Vector3::new(sx, sy, -1.0).normalized();
+            let rd = cam.basis_change(&rd_cam).normalized();
+            let col = cast_ray(&cam.eye, &rd, objects, light, sky, tex_albedo, 0);
+
+            fb.set_current_color(v3_to_color(col));
+            fb.set_pixel(x, y);
+        }
+    }
+}
+
+// === escena: casa sencilla con 5 materiales + agua refractiva y vidrio reflectivo ===
 fn main() {
-    let (mut rl, thread) = raylib::init()
-        .size(WINDOW_W, WINDOW_H)
-        .title("SLS Diorama (Raytracing + Rayon) - UVG")
+    let (mut rl, th) = raylib::init()
+        .size(960, 540)
+        .title("Diorama Raytracer — Casa sencilla")
         .build();
-    rl.set_target_fps(60);
 
-    // Imagen negra inicial
-    let img0 = Image::gen_image_color(RENDER_W as i32, RENDER_H as i32, Color::BLACK);
-    let tex = rl.load_texture_from_image(&thread, &img0).expect("texture");
+    // carga texturas CPU
+    let img_brick = Image::load_image("assets/textures/brick.png").expect("brick.png");
+    let img_wood  = Image::load_image("assets/textures/wood.png").expect("wood.png");
+    let img_quartz= Image::load_image("assets/textures/quartz.png").expect("quartz.png");
+    let img_glass = Image::load_image("assets/textures/glass.png").expect("glass.png");
+    let img_water = Image::load_image("assets/textures/water.png").expect("water.png");
 
-    // ---------- Escena ----------
-    let mut scene = Scene::new();
+    let tex_brick = TextureCPU::from_image(&img_brick).unwrap();
+    let tex_wood  = TextureCPU::from_image(&img_wood).unwrap();
+    let tex_quartz= TextureCPU::from_image(&img_quartz).unwrap();
+    let tex_glass = TextureCPU::from_image(&img_glass).unwrap();
+    let tex_water = TextureCPU::from_image(&img_water).unwrap();
 
-    // Skybox (usa tus 6 archivos: px/nx/py/ny/pz/nz)
-    scene.skybox = Some(load_cubemap(
-        "textures/skybox/px.png",
-        "textures/skybox/nx.png",
-        "textures/skybox/py.png",
-        "textures/skybox/ny.png",
-        "textures/skybox/pz.png",
-        "textures/skybox/nz.png",
+    // skybox
+    let sky = Skybox::new(
+        TextureCPU::from_image(&Image::load_image("assets/sky/nx.png").unwrap()).unwrap(),
+        TextureCPU::from_image(&Image::load_image("assets/sky/px.png").unwrap()).unwrap(),
+        TextureCPU::from_image(&Image::load_image("assets/sky/ny.png").unwrap()).unwrap(),
+        TextureCPU::from_image(&Image::load_image("assets/sky/py.png").unwrap()).unwrap(),
+        TextureCPU::from_image(&Image::load_image("assets/sky/nz.png").unwrap()).unwrap(),
+        TextureCPU::from_image(&Image::load_image("assets/sky/pz.png").unwrap()).unwrap(),
+    );
+
+    // materiales (kd, shininess, [kd,ks,kr,kt], ior)
+    let mat_brick  = Material::new(Vector3::new(0.9,0.9,0.9), 32.0, [0.9,0.1,0.0,0.0], 1.0);
+    let mat_wood   = Material::new(Vector3::new(0.9,0.8,0.7), 32.0, [0.95,0.05,0.0,0.0], 1.0);
+    let mat_quartz = Material::new(Vector3::new(1.0,1.0,1.0), 64.0, [0.8,0.2,0.0,0.0], 1.0);
+    let mat_glass  = Material::new(Vector3::new(1.0,1.0,1.0), 96.0, [0.1,0.3,0.4,0.4], 1.5); // reflexión + refracción
+    let mat_water  = Material::new(Vector3::new(0.8,0.9,1.0), 16.0, [0.2,0.1,0.05,0.65], 1.33);
+
+    // construye casa (tamaño controlado)
+    let mut objects: Vec<Box<dyn RayIntersect + Sync>> = Vec::new();
+
+    // plataforma (cuarzo) – más “baldozas”
+    objects.push(Box::new(
+        Cube::from_center_size(
+            Vector3::new(0.0,-0.55, 0.0), 
+            Vector3::new(6.0,0.5,6.0), 
+            mat_quartz
+        ).with_tiling(5.0) // <-- repite 5x
     ));
 
-    // Luces
-    scene.lights.push(Light::Ambient(Vec3::new(0.25, 0.25, 0.25)));
-    scene.lights.push(Light::Directional {
-        dir: Vec3::new(-0.7, -1.0, -0.35).normalized(),
-        intensity: Vec3::new(1.25, 1.25, 1.25),
-    });
+    // paredes (ladrillo)
+    objects.push(Box::new(
+        Cube::from_center_size(Vector3::new(0.0, 0.5, -1.5), Vector3::new(3.0, 2.0, 0.2), mat_brick)
+            .with_tiling(3.5)
+    ));
+    // frontal izquierda/derecha
+    objects.push(Box::new(
+        Cube::from_center_size(Vector3::new(-0.9, 0.5, 1.5), Vector3::new(1.2, 2.0, 0.2), mat_brick)
+            .with_tiling(3.5)
+    ));
+    objects.push(Box::new(
+        Cube::from_center_size(Vector3::new( 0.9, 0.5, 1.5), Vector3::new(1.2, 2.0, 0.2), mat_brick)
+            .with_tiling(3.5)
+    ));
+    // laterales
+    objects.push(Box::new(
+        Cube::from_center_size(Vector3::new(-1.5, 0.5, 0.0), Vector3::new(0.2, 2.0, 3.2), mat_brick)
+            .with_tiling(3.5)
+    ));
+    objects.push(Box::new(
+        Cube::from_center_size(Vector3::new( 1.5, 0.5, 0.0), Vector3::new(0.2, 2.0, 3.2), mat_brick)
+            .with_tiling(3.5)
+    ));
 
-    // ======== Materiales (texturas activas donde conviene) ========
-    let mat_grass = Material::new(MaterialKind::Lambert {
-        albedo: Vec3::new(0.18, 0.49, 0.20),
-        roughness: 0.97,
-        tex: None,
-    });
-    let mat_concrete = Material::new(MaterialKind::Lambert {
-        albedo: Vec3::new(0.80, 0.80, 0.80),
-        roughness: 0.95,
-        tex: Some(Texture::Image(load_image_tex("textures/pad_concrete.png", 1.6))),
-    });
-    let mat_tower = Material::new(MaterialKind::CookTorrance {
-        albedo: Vec3::new(0.85, 0.12, 0.12),
-        metallic: 0.85,
-        roughness: 0.45,
-        tex: Some(Texture::Image(load_image_tex("textures/tower_red.png", 2.0))),
-    });
-    let mat_orange = Material::new(MaterialKind::CookTorrance {
-        albedo: Vec3::new(0.90, 0.58, 0.18),
-        metallic: 0.05,
-        roughness: 0.62,
-        tex: Some(Texture::Image(load_image_tex("textures/rocket_orange.png", 2.2))),
-    });
-    let mat_white = Material::new(MaterialKind::CookTorrance {
-        albedo: Vec3::new(0.95, 0.95, 0.98),
-        metallic: 0.04,
-        roughness: 0.42,
-        tex: Some(Texture::Image(load_image_tex("textures/rocket_white.png", 2.0))),
-    });
-    let mat_black = Material::new(MaterialKind::CookTorrance {
-        albedo: Vec3::new(0.08, 0.07, 0.07),
-        metallic: 0.75,
-        roughness: 0.22,
-        tex: Some(Texture::Image(load_image_tex("textures/rocket_black.png", 2.0))),
-    });
-    let mat_window = Material::new(MaterialKind::Dielectric {
-        albedo: Vec3::new(0.94, 0.97, 1.0),
-        ior: 1.50,
-        transparency: 0.82,
-        reflectivity: 0.10,
-        roughness: 0.0,
-    });
-    let mat_decal = Material::new(MaterialKind::Lambert {
-        albedo: Vec3::one(),
-        roughness: 0.9,
-        tex: Some(Texture::Image(load_image_tex("textures/rocket_decal.png", 1.0))),
-    });
+    // techo (madera) – mucho tiling para vetas finas
+    objects.push(Box::new(
+        Cube::from_center_size(Vector3::new(0.0, 1.6, 0.0), Vector3::new(3.4, 0.2, 3.6), mat_wood)
+            .with_tiling(6.0)
+    ));
 
-    // ---------- Geometría SLS ----------
-    build_sls_scene(
-        &mut scene,
-        &mat_grass,
-        &mat_concrete,
-        &mat_tower,
-        &mat_orange,
-        &mat_white,
-        &mat_black,
-        &mat_window,
-        &mat_decal,
+    // ventanas (cristal) – 1:1 o un poco de tiling si tu textura lo permite
+    objects.push(Box::new(
+        Cube::from_center_size(Vector3::new(0.0, 0.8, -1.4), Vector3::new(1.2, 0.8, 0.05), mat_glass)
+            .with_tiling(1.5)
+    ));
+    objects.push(Box::new(
+        Cube::from_center_size(Vector3::new(-1.4, 0.8, 0.0), Vector3::new(0.05, 0.8, 1.0), mat_glass)
+            .with_tiling(1.5)
+    ));
+
+    // agua – un tiling moderado
+    objects.push(Box::new(
+        Cube::from_center_size(Vector3::new(0.0, -0.49, 2.6), Vector3::new(1.8, 0.12, 1.2), mat_water)
+            .with_tiling(2.5)
+    ));
+
+
+    // función para muestrear albedo texturizado por material
+    let albedo_fn = move |hit: &Intersect| -> Vector3 {
+        let (u,v) = hit.uv;
+        // el tinte de material multiplica la textura
+        let tint = hit.mat.diffuse;
+        // decide cuál textura usar (sencillo: por puntero de ior/albedo)
+        if (hit.mat.ior - 1.5).abs() < 0.01 { return tex_glass.sample_repeat(u,v) * tint; }
+        if (hit.mat.ior - 1.33).abs() < 0.02 { return tex_water.sample_repeat(u,v) * tint; }
+        // compara por ks alto? aquí por afinidad:
+        if hit.mat.specular_exp >= 60.0 && hit.mat.albedo[1] >= 0.2 { return tex_quartz.sample_repeat(u,v) * tint; }
+        // ladrillo vs madera: heurística por tamaño del bloque en Y (techo delgado → madera)
+        if hit.normal.y.abs() > 0.9 && hit.mat.albedo[0] > 0.9 && hit.mat.specular_exp < 40.0 {
+            return tex_wood.sample_repeat(u,v) * tint;
+        }
+        tex_brick.sample_repeat(u,v) * tint
+    };
+
+    // luz
+    let light = Light::new(
+        Vector3::new(2.5, 3.0, 3.0),
+        Vector3::new(1.0, 1.0, 1.0),
+        1.5
     );
 
-    // ---------- Cámara: más lejos + pan Y por flechas ↑/↓ ----------
-    let target = Vec3::new(0.0, 3.2, 0.0);
-    let mut cam = OrbitalCam::new(
-        target,
-        /* distance */ 15.5,  // ← más alejada
-        /* azim  */ 1.05,
-        /* elev  */ 0.35,     // pitch fijo suave
-        /* fov_y */ CAM_FOV_DEG,
-        /* aspect */ RENDER_W as f32 / RENDER_H as f32,
+    // cámara
+    let mut cam = Camera::new(
+        Vector3::new(4.0, 2.2, 5.0),
+        Vector3::new(0.0, 0.6, 0.0),
+        Vector3::new(0.0, 1.0, 0.0)
     );
 
-    // Buffer final (siempre tamaño RENDER_W/H)
-    let mut rgba: Vec<u8> = vec![0; RENDER_W * RENDER_H * 4];
+    let mut fb = Framebuffer::new(960, 540);
 
-    // Auto–resolución (objetivo ~30 FPS más agresivo)
-    let mut moving_avg_ms = 30.0_f32;
-
+    rl.set_target_fps(30);
     while !rl.window_should_close() {
-        // -------- Input suave --------
-        let dt = rl.get_frame_time();
-        let boost = if rl.is_key_down(KeyboardKey::KEY_LEFT_SHIFT) || rl.is_key_down(KeyboardKey::KEY_RIGHT_SHIFT) { 2.2 } else { 1.0 };
+        // Controles:
+        // ← → → orbita yaw
+        if rl.is_key_down(KeyboardKey::KEY_LEFT)  { cam.orbit( 0.02, 0.0); }
+        if rl.is_key_down(KeyboardKey::KEY_RIGHT) { cam.orbit(-0.02, 0.0); }
+        // ↑ ↓ → orbita pitch
+        if rl.is_key_down(KeyboardKey::KEY_UP)    { cam.orbit(0.0, -0.02); }
+        if rl.is_key_down(KeyboardKey::KEY_DOWN)  { cam.orbit(0.0,  0.02); }
+        // Zoom dolly (W/S)
+        if rl.is_key_down(KeyboardKey::KEY_W)     { cam.dolly( 0.10); }
+        if rl.is_key_down(KeyboardKey::KEY_S)     { cam.dolly(-0.10); }
+        // Guardar frame (P)
+        if rl.is_key_pressed(KeyboardKey::KEY_P)  { fb.save_png("frame.png"); }
 
-        // ORBITA (izq/der)
-        if rl.is_key_down(KeyboardKey::KEY_RIGHT) { cam.azim += CAM_AZIM_SPEED * boost * dt; }
-        if rl.is_key_down(KeyboardKey::KEY_LEFT)  { cam.azim -= CAM_AZIM_SPEED * boost * dt; }
-
-        // PAN VERTICAL (arr/aba)
-        if rl.is_key_down(KeyboardKey::KEY_UP)    { cam.y_ofs += CAM_PAN_Y_SPEED * boost * dt; }
-        if rl.is_key_down(KeyboardKey::KEY_DOWN)  { cam.y_ofs -= CAM_PAN_Y_SPEED * boost * dt; }
-        // Limita el pan vertical para no perder el SLS de vista
-        if cam.y_ofs < -2.0 { cam.y_ofs = -2.0; }
-        if cam.y_ofs >  6.0 { cam.y_ofs =  6.0; }
-
-        // ZOOM (PgUp/PgDn y +/- numpad)
-        if rl.is_key_down(KeyboardKey::KEY_PAGE_UP) || rl.is_key_down(KeyboardKey::KEY_EQUAL) || rl.is_key_down(KeyboardKey::KEY_KP_ADD) {
-            cam.distance -= CAM_ZOOM_SPEED * boost * dt;
-        }
-        if rl.is_key_down(KeyboardKey::KEY_PAGE_DOWN) || rl.is_key_down(KeyboardKey::KEY_MINUS) || rl.is_key_down(KeyboardKey::KEY_KP_SUBTRACT) {
-            cam.distance += CAM_ZOOM_SPEED * boost * dt;
-        }
-        if cam.distance < 7.0  { cam.distance = 7.0; }
-        if cam.distance > 24.0 { cam.distance = 24.0; }
-
-        unsafe {
-            if rl.is_key_pressed(KeyboardKey::KEY_F1) { QUALITY_SCALE = 0.60; } // rápido
-            if rl.is_key_pressed(KeyboardKey::KEY_F2) { QUALITY_SCALE = 1.00; } // calidad
-        }
-
-        // -------- Ray frame de la cámara --------
-        let (cam_o, mut base_u, base_v, fwd) = cam.frame();
-
-        // FIX del flip horizontal:
-        base_u = base_u * -1.0;
-
-        // -------- Render paralelo + downscale --------
-        let (eff_w, eff_h) = unsafe {
-            let s = QUALITY_SCALE.clamp(0.45, 1.0);
-            (((RENDER_W as f32)*s) as usize, ((RENDER_H as f32)*s) as usize)
-        };
-
-        let mut small = vec![0u8; eff_w * eff_h * 4];
-
-        let t0 = Instant::now();
-
-        small.par_chunks_mut(4).enumerate().for_each(|(i, px)| {
-            let x = (i % eff_w) as i32;
-            let y = (i / eff_w) as i32;
-
-            // Coordenadas normalizadas
-            let u = (x as f32 + 0.5) / eff_w as f32;
-            let v = (y as f32 + 0.5) / eff_h as f32;
-
-            // FIX del flip vertical (raylib dibuja con origen arriba-izquierda):
-            let v_img = 1.0 - v;
-
-            let dir = (fwd + base_u * (u * 2.0 - 1.0) + base_v * (v_img * 2.0 - 1.0)).normalized();
-            let ray = Ray { o: cam_o, d: dir };
-
-            let c = shading::ray_color(&scene, &ray, 0);
-
-            px[0] = (c.x.clamp(0.0, 1.0) * 255.0) as u8;
-            px[1] = (c.y.clamp(0.0, 1.0) * 255.0) as u8;
-            px[2] = (c.z.clamp(0.0, 1.0) * 255.0) as u8;
-            px[3] = 255;
-        });
-
-        let ms = t0.elapsed().as_secs_f32() * 1000.0;
-        // EWMA simple
-        moving_avg_ms = moving_avg_ms * 0.85 + ms * 0.15;
-
-        // Auto–resolución para mantener ~30 ms (≈33 FPS) algo más agresivo
-        unsafe {
-            let target_ms = 30.0_f32;
-            let mut s = QUALITY_SCALE;
-            if moving_avg_ms > target_ms * 1.08 && s > 0.45 {
-                s *= 0.92; // baja un poco
-            } else if moving_avg_ms < target_ms * 0.88 && s < 1.0 {
-                s *= 1.04; // sube un poquito
-            }
-            QUALITY_SCALE = s.clamp(0.45, 1.0);
-        }
-
-        // Upscale si fue render parcial
-        let mut rgba = &mut rgba; // alias local para borrow
-        if eff_w != RENDER_W || eff_h != RENDER_H {
-            for y in 0..RENDER_H {
-                let ys = (y * eff_h) / RENDER_H;
-                for x in 0..RENDER_W {
-                    let xs = (x * eff_w) / RENDER_W;
-                    let src = (ys * eff_w + xs) * 4;
-                    let dst = (y * RENDER_W + x) * 4;
-                    rgba[dst..dst + 4].copy_from_slice(&small[src..src + 4]);
-                }
-            }
-        } else {
-            rgba.copy_from_slice(&small);
-        }
-
-        // Actualizar textura sin mover `tex`
-        unsafe {
-            ffi::UpdateTexture(*tex.as_ref(), rgba.as_ptr() as *const c_void);
-        }
-
-        // -------- Dibujo (escalado a la ventana completa) --------
-        let mut d = rl.begin_drawing(&thread);
-        d.clear_background(Color::BLACK);
-
-        let src = Rectangle { x: 0.0, y: 0.0, width: RENDER_W as f32, height: RENDER_H as f32 };
-        let dst = Rectangle { x: 0.0, y: 0.0, width: WINDOW_W as f32, height: WINDOW_H as f32 };
-        let origin = Vector2 { x: 0.0, y: 0.0 };
-        d.draw_texture_pro(&tex, src, dst, origin, 0.0, Color::WHITE);
-
-        d.draw_text("←/→: rotar | ↑/↓: pan vertical | PgUp/PgDn (+/-): zoom | Shift: rápido | F1/F2: calidad",
-                    12, 12, 18, Color::RAYWHITE);
-    }
-}
-
-// =================== Construcción de escena ===================
-
-fn build_sls_scene(
-    scene: &mut Scene,
-    mat_grass: &Material,
-    mat_concrete: &Material,
-    mat_tower: &Material,
-    mat_orange: &Material,
-    mat_white: &Material,
-    mat_black: &Material,
-    mat_window: &Material,
-    mat_decal: &Material,
-) {
-    // --- Suelo plano (rápido) ---
-    scene.planes.push(Plane {
-        point: Vec3::new(0.0, 0.0, 0.0),
-        normal: Vec3::new(0.0, 1.0, 0.0),
-        mat: mat_grass.clone(),
-    });
-
-    // --- Plataforma de concreto (contenida para rendimiento) ---
-    let pad_y0 = 0.0;
-    let pad_y1 = 0.5;
-    scene.add_box(Aabb::from_min_max(Vec3::new(-4.5, pad_y0, -4.5), Vec3::new( 4.5, pad_y1,  4.5), mat_concrete.clone()));
-    scene.add_box(Aabb::from_min_max(Vec3::new(-3.2, pad_y1, -3.2), Vec3::new( 3.2, pad_y1+0.6, 3.2), mat_concrete.clone()));
-
-    // --- Torre (delgada y desplazada para no tapar) ---
-    let tower_x = 4.7;
-    let tower_h = 9.0;
-    scene.add_box(Aabb::from_min_max(Vec3::new(tower_x-0.25, pad_y1,   -0.5),
-                                     Vec3::new(tower_x+0.25, pad_y1+tower_h, 0.5), mat_tower.clone()));
-    // brazos simples
-    scene.add_box(Aabb::from_min_max(Vec3::new(tower_x-0.25, pad_y1+5.2,  0.5),
-                                     Vec3::new(2.4,          pad_y1+5.5,  0.9), mat_tower.clone()));
-    scene.add_box(Aabb::from_min_max(Vec3::new(tower_x-0.25, pad_y1+7.1, -0.9),
-                                     Vec3::new(2.6,          pad_y1+7.4, -0.5), mat_tower.clone()));
-
-    // --- SLS dimensiones aproximadas (escala “voxel”) ---
-    let base_y  = pad_y1 + 0.6;
-    let core_r  = 1.15;
-    let core_h  = 8.6;
-
-    // Core naranja
-    scene.add_box(Aabb::from_min_max(Vec3::new(-core_r, base_y, -core_r),
-                                     Vec3::new( core_r, base_y+core_h, core_r), mat_orange.clone()));
-
-    // “Intertank” banda negra
-    scene.add_box(Aabb::from_min_max(Vec3::new(-core_r, base_y+2.2, -core_r),
-                                     Vec3::new( core_r, base_y+2.5,  core_r), mat_black.clone()));
-
-    // ICPS / etapa superior (blanca)
-    let upper_h = 1.5;
-    scene.add_box(Aabb::from_min_max(Vec3::new(-0.9, base_y+core_h, -0.9),
-                                     Vec3::new( 0.9, base_y+core_h+upper_h, 0.9), mat_white.clone()));
-
-    // Adaptador + Orion/LES (negro/blanco)
-    scene.add_box(Aabb::from_min_max(Vec3::new(-0.65, base_y+core_h+upper_h, -0.65),
-                                     Vec3::new( 0.65, base_y+core_h+upper_h+0.9, 0.65), mat_black.clone()));
-    scene.add_box(Aabb::from_min_max(Vec3::new(-0.40, base_y+core_h+upper_h+0.9, -0.40),
-                                     Vec3::new( 0.40, base_y+core_h+upper_h+1.6, 0.40), mat_white.clone()));
-    // punta LES
-    scene.add_box(Aabb::from_min_max(Vec3::new(-0.18, base_y+core_h+upper_h+1.6, -0.18),
-                                     Vec3::new( 0.18, base_y+core_h+upper_h+2.2, 0.18), mat_black.clone()));
-
-    // Ventanas (4 caras)
-    let win_y0 = base_y + core_h + 0.25;
-    let win_y1 = win_y0 + 0.45;
-    let rc = core_r;
-    scene.add_box(Aabb::from_min_max(Vec3::new(-0.55, win_y0, rc-0.10), Vec3::new( 0.55, win_y1, rc+0.10), mat_window.clone()));
-    scene.add_box(Aabb::from_min_max(Vec3::new(-0.55, win_y0,-rc-0.10), Vec3::new( 0.55, win_y1,-rc+0.10), mat_window.clone()));
-    scene.add_box(Aabb::from_min_max(Vec3::new( rc-0.10, win_y0,-0.55), Vec3::new( rc+0.10, win_y1, 0.55), mat_window.clone()));
-    scene.add_box(Aabb::from_min_max(Vec3::new(-rc-0.10, win_y0,-0.55), Vec3::new(-rc+0.10, win_y1, 0.55), mat_window.clone()));
-
-    // Decals (4 tiras perimetrales)
-    let dec_y0 = base_y + 1.3;
-    let dec_y1 = dec_y0 + 0.8;
-    scene.add_box(Aabb::from_min_max(Vec3::new(-rc,     dec_y0,  rc+0.01), Vec3::new( rc,     dec_y1,  rc+0.10), mat_decal.clone()));
-    scene.add_box(Aabb::from_min_max(Vec3::new(-rc,     dec_y0, -rc-0.10), Vec3::new( rc,     dec_y1, -rc-0.01), mat_decal.clone()));
-    scene.add_box(Aabb::from_min_max(Vec3::new( rc+0.01,dec_y0, -rc     ), Vec3::new( rc+0.10,dec_y1,  rc     ), mat_decal.clone()));
-    scene.add_box(Aabb::from_min_max(Vec3::new(-rc-0.10,dec_y0, -rc     ), Vec3::new(-rc-0.01,dec_y1,  rc     ), mat_decal.clone()));
-
-    // Motor mount (negro)
-    scene.add_box(Aabb::from_min_max(Vec3::new(-0.50, base_y-0.55, -0.50),
-                                     Vec3::new( 0.50, base_y,       0.50), mat_black.clone()));
-
-    // SRBs (dos boosters, blancos)
-    let srb_off = 2.4;
-    let srb_r   = 0.55;
-    let srb_h   = 8.2;
-    let srb_blocks = [
-        (-srb_r, -srb_r,  srb_off,      srb_r,  srb_r,  srb_off+0.8),
-        (-srb_r, -srb_r, -srb_off-0.8,  srb_r,  srb_r, -srb_off  ),
-        ( srb_off, -srb_r,-srb_r,  srb_off+0.8, srb_r,  srb_r),
-        (-srb_off-0.8, -srb_r,-srb_r,  -srb_off,      srb_r,  srb_r),
-    ];
-    for (x0,_z0,y0,x1,_z1,y1) in srb_blocks {
-        scene.add_box(Aabb::from_min_max(
-            Vec3::new(x0, base_y, y0),
-            Vec3::new(x1, base_y+srb_h, y1),
-            mat_white.clone(),
-        ));
-    }
-    // narices de SRB
-    scene.add_box(Aabb::from_min_max(Vec3::new( srb_off+0.15, base_y+srb_h, -0.25),
-                                     Vec3::new( srb_off+0.55, base_y+srb_h+0.7, 0.25), mat_black.clone()));
-    scene.add_box(Aabb::from_min_max(Vec3::new(-srb_off-0.55, base_y+srb_h, -0.25),
-                                     Vec3::new(-srb_off-0.15, base_y+srb_h+0.7, 0.25), mat_black.clone()));
-
-    // costillas en el core (detalle leve, barato)
-    for k in 0..6 {
-        let t0 = base_y + 0.4 + k as f32 * 1.3;
-        scene.add_box(Aabb::from_min_max(Vec3::new(-core_r, t0, -core_r-0.08),
-                                         Vec3::new( core_r, t0+0.07, -core_r+0.08), mat_orange.clone()));
-        scene.add_box(Aabb::from_min_max(Vec3::new(-core_r, t0,  core_r-0.08),
-                                         Vec3::new( core_r, t0+0.07,  core_r+0.08), mat_orange.clone()));
+        fb.clear();
+        render(&mut fb, &cam, &light, &sky, &objects, &albedo_fn);
+        fb.blit(&mut rl, &th);
     }
 }

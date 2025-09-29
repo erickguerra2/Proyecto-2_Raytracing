@@ -1,39 +1,41 @@
-use std::fs::File;
-use std::io::Write;
-use crate::math::Vec3;
+use raylib::prelude::*;
 
-pub struct FrameBuffer{ pub w:u32, pub h:u32, pub data:Vec<Vec3> }
+pub struct Framebuffer {
+    pub width: u32,
+    pub height: u32,
+    pub color: Image,
+    bg: Color,
+    cur: Color,
+}
 
-impl FrameBuffer{
-    pub fn new(w:u32,h:u32)->Self{ Self{ w,h, data: vec![Vec3::zero(); (w*h) as usize ] } }
-    fn idx(&self,x:u32,y:u32)->usize{ (y*self.w + x) as usize }
-    pub fn set(&mut self, x:u32, y:u32, c:Vec3) {
-        let i = self.idx(x, y);
-        self.data[i] = c;
-        }
-
-
-    pub fn as_rgba8(&self) -> Vec<u8> {
-        let mut out = vec![0u8; (self.w*self.h*4) as usize];
-        for (i, c) in self.data.iter().enumerate() {
-            let r = (c.x.clamp(0.0,1.0)*255.0) as u8;
-            let g = (c.y.clamp(0.0,1.0)*255.0) as u8;
-            let b = (c.z.clamp(0.0,1.0)*255.0) as u8;
-            let j = i*4;
-            out[j] = r; out[j+1] = g; out[j+2] = b; out[j+3] = 255;
-        }
-        out
+impl Framebuffer {
+    pub fn new(w: u32, h: u32) -> Self {
+        let color = Image::gen_image_color(w as i32, h as i32, Color::BLACK);
+        Self { width: w, height: h, color, bg: Color::BLACK, cur: Color::WHITE }
     }
 
-    pub fn write_ppm(&self, path:&str) -> std::io::Result<()> {
-        let mut f = File::create(path)?;
-        writeln!(f, "P3\n{} {}\n255", self.w, self.h)?;
-        for c in &self.data {
-            let r = (c.x.clamp(0.0,1.0)*255.0) as u32;
-            let g = (c.y.clamp(0.0,1.0)*255.0) as u32;
-            let b = (c.z.clamp(0.0,1.0)*255.0) as u32;
-            writeln!(f, "{} {} {}", r, g, b)?;
+    pub fn clear(&mut self) {
+        self.color = Image::gen_image_color(self.width as i32, self.height as i32, self.bg);
+    }
+
+    pub fn set_current_color(&mut self, c: Color) { self.cur = c; }
+
+    pub fn set_pixel(&mut self, x: u32, y: u32) {
+        if x < self.width && y < self.height {
+            self.color.draw_pixel(x as i32, y as i32, self.cur);
         }
-        Ok(())
+    }
+
+    pub fn save_png(&self, path: &str) {
+        // ignora error si no puede escribir
+        let _ = self.color.export_image(path);
+    }
+
+    pub fn blit(&self, rl: &mut RaylibHandle, th: &RaylibThread) {
+        if let Ok(tex) = rl.load_texture_from_image(th, &self.color) {
+            let mut d = rl.begin_drawing(th);
+            d.clear_background(Color::BLACK);
+            d.draw_texture(&tex, 0, 0, Color::WHITE);
+        }
     }
 }
